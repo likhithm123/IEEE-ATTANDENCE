@@ -65,6 +65,16 @@ function parseDateSegment(value) {
   if (!day || !month || Number.isNaN(year)) return 0;
   return new Date(2000 + year, month - 1, day).getTime();
 }
+function isDateLocked(value) {
+  // Expect format "DD-MM-YY"
+  const timestamp = parseDateSegment(value);
+  if (!timestamp) return false;
+  const selected = new Date(timestamp);
+  selected.setHours(0, 0, 0, 0);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return selected < today;
+}
 
 function sortDateOptions(dates) {
   return [...dates].sort((a, b) => parseDateSegment(b.value) - parseDateSegment(a.value));
@@ -93,7 +103,9 @@ export default function Dashboard() {
   const [manualUser, setManualUser] = useState({ name: '', email: '', reg_no: '', role: 'participant' });
   const [editingUser, setEditingUser] = useState(null);
   const [addingManual, setAddingManual] = useState(false);
-
+  const [searchQuery, setSearchQuery] = useState('');
+  const [savingRows, setSavingRows] = useState({});
+  const [resettingRows, setResettingRows] = useState({});
   const fetchDates = useCallback(async () => {
     const res = await fetch('/api/dates');
     const data = await res.json();
@@ -163,6 +175,7 @@ export default function Dashboard() {
   const emailClean = user?.email?.toLowerCase().trim() || '';
   const isAdmin = ADMINS.includes(emailClean);
   const isManager = MANAGERS.includes(emailClean);
+  const isParticipant = !isAdmin && !isManager;
   const currentRole = isAdmin ? 'Admin' : isManager ? 'Manager' : 'Participant';
 
   const stats = useMemo(() => {
@@ -173,9 +186,16 @@ export default function Dashboard() {
     return { total, coming, requested, marked };
   }, [records]);
 
+  const filteredRecords = useMemo(() => {
+    if (!searchQuery.trim()) return records;
+    const query = searchQuery.toLowerCase().trim();
+    return records.filter((row) => row.profiles.name?.toLowerCase().includes(query));
+  }, [records, searchQuery]);
+
   const handleCellChange = async (recordId, targetProfileId, columnName, newValue) => {
     const previousRecords = [...records];
     setRecords(records.map((r) => (r.profiles.id === targetProfileId ? { ...r, [columnName]: newValue } : r)));
+    setSavingRows((prev) => ({ ...prev, [targetProfileId]: 'saving' }));
 
     const res = await fetch('/api/attendance', {
       method: 'PATCH',
@@ -193,6 +213,46 @@ export default function Dashboard() {
       const message = result.error || 'Failed to save update.';
       alert(`Access denied: ${message}`);
       setRecords(previousRecords);
+      setSavingRows((prev) => ({ ...prev, [targetProfileId]: 'error' }));
+    } else {
+      setSavingRows((prev) => ({ ...prev, [targetProfileId]: 'saved' }));
+      setTimeout(() => {
+        setSavingRows((prev) => ({ ...prev, [targetProfileId]: 'idle' }));
+      }, 2000);
+    }
+  };
+
+  const handleRowSave = async (row) => {
+    const targetProfileId = row.profiles.id;
+    setSavingRows((prev) => ({ ...prev, [targetProfileId]: 'saving' }));
+
+    const updates = {
+      coming: row.coming || null,
+      request: row.request || null,
+      attendance_1: row.attendance_1 || null,
+      attendance_2: row.attendance_2 || null,
+    };
+
+    const res = await fetch('/api/attendance', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        recordId: row.id,
+        targetProfileId,
+        dateString: selectedDate,
+        updates,
+      }),
+    });
+
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      setSavingRows((prev) => ({ ...prev, [targetProfileId]: 'error' }));
+      alert(`Error: ${data.error || 'Failed to save row.'}`);
+    } else {
+      setSavingRows((prev) => ({ ...prev, [targetProfileId]: 'saved' }));
+      setTimeout(() => {
+        setSavingRows((prev) => ({ ...prev, [targetProfileId]: 'idle' }));
+      }, 2000);
     }
   };
 
@@ -558,6 +618,28 @@ export default function Dashboard() {
     await fetchData();
   };
 
+  const handleResetPassword = async (user) => {
+    const { id, name } = user;
+    setResettingRows((prev) => ({ ...prev, [id]: true }));
+    try {
+      const res = await fetch('/api/admin/users/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, name }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to reset password');
+      }
+      alert(`Password reset successfully for ${name}. Temporary password is ${name}@123`);
+    } catch (error) {
+      console.error('Reset password error:', error);
+      alert(error.message);
+    } finally {
+      setResettingRows((prev) => ({ ...prev, [id]: false }));
+    }
+  };
+
   const handleDeleteUser = async (profile) => {
     if (!window.confirm(`Delete ${profile.name} and all of their attendance records?`)) return;
 
@@ -717,6 +799,12 @@ export default function Dashboard() {
       </header>
 
       <main className="mx-auto flex max-w-7xl flex-col gap-5 px-3 py-4 sm:px-6 sm:py-5">
+        {isParticipant && Object.keys(participantDrafts).length > 0 && (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800 shadow-sm animate-pulse flex items-center gap-2">
+            <span className="text-base">⚠️</span>
+            <span>You have unsaved changes in your attendance. Please click <strong>Save</strong> in your row below to update.</span>
+          </div>
+        )}
         <section className="grid grid-cols-2 gap-3 md:grid-cols-4">
           <Stat label="People" value={stats.total} />
           <Stat label="Coming" value={stats.coming} tone="green" />
@@ -733,6 +821,28 @@ export default function Dashboard() {
           </div>
           <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+              <div className="relative w-full sm:w-[240px]">
+                <input
+                  type="text"
+                  placeholder="Search by name..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="h-10 w-full rounded-md border border-slate-300 bg-white pl-9 pr-3 text-sm placeholder:text-slate-400 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                />
+                <svg
+                  className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+                  />
+                </svg>
+              </div>
               <select
                 value={selectedDate}
                 onChange={(e) => setSelectedDate(e.target.value)}
@@ -798,7 +908,7 @@ export default function Dashboard() {
             Swipe sideways to view all attendance columns.
           </div>
           <div className="-mx-3 overflow-x-auto sm:mx-0">
-            <table className="w-full min-w-[1120px] border-collapse text-left text-sm">
+            <table className="w-full min-w-[1200px] border-collapse text-left text-sm">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold uppercase tracking-wide text-slate-600">
                   <th className="w-[190px] px-4 py-3">Name</th>
@@ -809,24 +919,25 @@ export default function Dashboard() {
                   <th className="w-[130px] px-3 py-3 text-center">Request</th>
                   <th className="w-[145px] px-3 py-3 text-center">Attendance 1</th>
                   <th className="w-[145px] px-3 py-3 text-center">Attendance 2</th>
-                  {!isAdmin && !isManager && <th className="w-[110px] px-3 py-3 text-center">Save</th>}
+                  <th className="w-[120px] px-3 py-3 text-center">Save</th>
                   {isAdmin && <th className="w-[150px] px-3 py-3 text-center">Manage</th>}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 text-sm">
-                {records.length === 0 ? (
+                {filteredRecords.length === 0 ? (
                   <tr>
-                    <td colSpan={isAdmin ? 9 : !isManager ? 9 : 8} className="px-4 py-12 text-center text-slate-500">
-                      No user records found for this date.
+                    <td colSpan={isAdmin ? 10 : 9} className="px-4 py-12 text-center text-slate-500">
+                      {records.length === 0 ? 'No user records found for this date.' : 'No matching records found.'}
                     </td>
                   </tr>
                 ) : (
-                  records.map((row) => {
+                  filteredRecords.map((row) => {
                     const isOwnRow = row.profiles.id === user.id;
                     const isParticipant = !isAdmin && !isManager;
-                    const canEditComing = isAdmin || isManager || (isParticipant && isOwnRow && !row.coming);
-                    const canEditRequest = isAdmin || isManager || (isParticipant && isOwnRow && !row.request);
-                    const canEditAttendance = isAdmin || isManager;
+                    const dateLocked = !isAdmin && isDateLocked(selectedDate);
+                    const canEditComing = (!dateLocked && (isAdmin || isManager)) || (isParticipant && isOwnRow && !row.coming && !dateLocked);
+                    const canEditRequest = (!dateLocked && (isAdmin || isManager)) || (isParticipant && isOwnRow && !row.request && !dateLocked);
+                    const canEditAttendance = !dateLocked && (isAdmin || isManager);
                     const isEditing = editingUser?.id === row.profiles.id;
                     const draft = participantDrafts[getDraftKey(row.profiles.id)] || {};
                     const canSaveParticipant = isParticipant && isOwnRow && ((!row.coming && draft.coming) || (!row.request && draft.request));
@@ -911,22 +1022,52 @@ export default function Dashboard() {
                             onChange={(e) => handleCellChange(row.id, row.profiles.id, 'attendance_2', e.target.value)}
                           />
                         </td>
-                        {!isAdmin && !isManager && (
-                          <td className="px-3 py-2 text-center">
-                            {isOwnRow ? (
-                              <button
-                                type="button"
-                                onClick={() => handleParticipantSave(row)}
-                                disabled={!canSaveParticipant}
-                                className="h-9 rounded-md bg-blue-600 px-3 text-xs font-medium text-white transition hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-500"
-                              >
-                                Save
-                              </button>
+                        <td className="px-3 py-2 text-center">
+                          {isParticipant ? (
+                            isOwnRow ? (
+                              <div>
+                                <button
+                                  type="button"
+                                  onClick={() => handleParticipantSave(row)}
+                                  disabled={!canSaveParticipant}
+                                  className="h-9 rounded-md bg-blue-600 px-3 text-xs font-medium text-white transition hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-500"
+                                >
+                                  Save
+                                </button>
+                                {canSaveParticipant && (
+                                  <span className="block text-[10px] font-semibold text-amber-600 animate-pulse mt-0.5">
+                                    Click Save to update!
+                                  </span>
+                                )}
+                              </div>
                             ) : (
                               <span className="text-xs text-slate-400">Locked</span>
-                            )}
-                          </td>
-                        )}
+                            )
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => handleRowSave(row)}
+                              disabled={savingRows[row.profiles.id] === 'saving'}
+                              className={`h-9 rounded-md px-3 text-xs font-medium transition ${
+                                savingRows[row.profiles.id] === 'saving'
+                                  ? 'bg-amber-100 text-amber-700'
+                                  : savingRows[row.profiles.id] === 'saved'
+                                  ? 'bg-emerald-600 text-white'
+                                  : savingRows[row.profiles.id] === 'error'
+                                  ? 'bg-rose-600 text-white'
+                                  : 'bg-slate-800 text-white hover:bg-slate-700'
+                              }`}
+                            >
+                              {savingRows[row.profiles.id] === 'saving'
+                                ? 'Saving...'
+                                : savingRows[row.profiles.id] === 'saved'
+                                ? 'Saved ✓'
+                                : savingRows[row.profiles.id] === 'error'
+                                ? 'Error'
+                                : 'Save'}
+                            </button>
+                          )}
+                        </td>
                         {isAdmin && (
                           <td className="px-3 py-2">
                             {isEditing ? (
@@ -935,8 +1076,11 @@ export default function Dashboard() {
                                 <button type="button" onClick={() => setEditingUser(null)} className="rounded-md border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50">Cancel</button>
                               </div>
                             ) : (
-                              <div className="flex justify-center gap-2">
-                                <button type="button" onClick={() => setEditingUser({ id: row.profiles.id, name: row.profiles.name, email: row.profiles.email, reg_no: row.profiles.reg_no || '', role: row.profiles.role || 'participant' })} className="rounded-md border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50">Edit</button>
+                              <div className="flex flex-col gap-2">
+                                <div className="flex justify-center gap-2">
+                                  <button type="button" onClick={() => setEditingUser({ id: row.profiles.id, name: row.profiles.name, email: row.profiles.email, reg_no: row.profiles.reg_no || '', role: row.profiles.role || 'participant' })} className="rounded-md border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50">Edit</button>
+                                  <button type="button" onClick={() => handleResetPassword(row.profiles)} disabled={resettingRows[row.profiles.id]} className="rounded-md border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50">{resettingRows[row.profiles.id] ? '...' : 'Reset PW'}</button>
+                                </div>
                                 <button type="button" onClick={() => handleDeleteUser(row.profiles)} className="rounded-md border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-100">Delete</button>
                               </div>
                             )}
